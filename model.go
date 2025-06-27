@@ -11,19 +11,16 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// --- BUBBLE TEA MODEL & ITEMS ---
-
-// item represents a single service in our list.
+// item struct and its methods are unchanged.
 type item struct {
 	config           ServiceConfig
 	status           status
-	statusText       string // Used for error messages
+	statusText       string
 	connectionString string
 	containerID      string
-	confirming       confirmationAction // Are we confirming a destructive action?
+	confirming       confirmationAction
 }
 
-// Implement list.Item interface for item.
 func (i item) Title() string {
 	icon := "❓"
 	switch i.config.Type {
@@ -42,7 +39,6 @@ func (i item) Description() string {
 	if i.confirming == actionDelete {
 		return confirmStyle.Render("Confirm Delete? (y/n)")
 	}
-
 	statusStr := i.status.String()
 	switch i.status {
 	case statusError:
@@ -61,11 +57,12 @@ func (i item) FilterValue() string { return i.config.Name }
 
 // --- MAIN MODEL ---
 type model struct {
-	list       list.Model
-	spinner    spinner.Model
-	err        error
-	quitting   bool
-	showCopied bool // Flag to show "Copied!" message
+	list        list.Model
+	spinner     spinner.Model
+	err         error
+	quitting    bool
+	showCopied  bool
+	showingHelp bool // New state for showing the help view
 }
 
 func initialModel(cfg PlateConfig) model {
@@ -83,14 +80,13 @@ func initialModel(cfg PlateConfig) model {
 		BorderForeground(katistixOrange).
 		Foreground(katistixOrange).
 		Padding(0, 0, 0, 1)
-
 	delegate.Styles.SelectedTitle = selectedStyle
 	delegate.Styles.SelectedDesc = selectedStyle.Copy().Foreground(lipgloss.Color("250")).Faint(true)
 
 	l := list.New(items, delegate, 0, 0)
 	l.Title = "Plate Dev Environment"
 	l.Styles.Title = titleStyle
-	l.SetShowHelp(false) // We render our own help, and list wrapping is default.
+	l.SetShowHelp(false)
 
 	s := spinner.New(spinner.WithSpinner(spinner.Dot), spinner.WithStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("205"))))
 
@@ -111,6 +107,17 @@ func (m model) Init() tea.Cmd {
 
 //nolint:cyclop
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// If showing help, only listen for keys that hide it.
+	if m.showingHelp {
+		if key, ok := msg.(tea.KeyMsg); ok {
+			switch key.String() {
+			case "h", "q", "esc":
+				m.showingHelp = false
+			}
+		}
+		return m, nil
+	}
+
 	if m.quitting {
 		if _, ok := msg.(cleanupCompleteMsg); ok {
 			return m, tea.Quit
@@ -127,14 +134,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list.SetSize(listWidth, msg.Height-v-3)
 
 	case tea.KeyMsg:
-		// Don't let the list handle keystrokes when we're in confirmation mode.
+		// When in confirmation mode, we only want to handle y/n/esc.
 		if m.list.SelectedItem() != nil && m.list.SelectedItem().(item).confirming != actionNone {
-			selectedItem, ok := m.list.SelectedItem().(item)
-			if !ok {
-				return m, nil
-			}
+			selectedItem, _ := m.list.SelectedItem().(item)
 			selectedIndex := m.list.Index()
-
 			switch msg.String() {
 			case "y", "Y":
 				switch selectedItem.confirming {
@@ -153,11 +156,45 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		// Handle regular key presses.
+		switch msg.String() {
+		case "h":
+			m.showingHelp = true
+		case "q", "ctrl+c":
+			m.quitting = true
+			return m, stopAllContainersOnExit(m.list.Items())
+		case "s":
+			if selectedItem, ok := m.list.SelectedItem().(item); ok && selectedItem.status == statusRunning {
+				m.list.SetItem(m.list.Index(), selectedItem)
+				return m, stopContainerCmd(m.list.Index(), selectedItem.containerID)
+			}
+		case "b":
+			if selectedItem, ok := m.list.SelectedItem().(item); ok && selectedItem.status == statusStopped {
+				m.list.SetItem(m.list.Index(), selectedItem)
+				return m, restartContainerCmd(m.list.Index(), selectedItem.config, selectedItem.containerID)
+			}
+		case "r":
+			if selectedItem, ok := m.list.SelectedItem().(item); ok && selectedItem.containerID != "" {
+				selectedItem.confirming = actionReset
+				return m, m.list.SetItem(m.list.Index(), selectedItem)
+			}
+		case "d":
+			if selectedItem, ok := m.list.SelectedItem().(item); ok && selectedItem.containerID != "" {
+				selectedItem.confirming = actionDelete
+				return m, m.list.SetItem(m.list.Index(), selectedItem)
+			}
+		case "c":
+			if selectedItem, ok := m.list.SelectedItem().(item); ok && selectedItem.status == statusRunning && selectedItem.connectionString != "" {
+				m.showCopied = true
+				return m, tea.Batch(copyToClipboardCmd(selectedItem.connectionString), tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return copiedToClipboardMsg{} }))
+			}
+		}
 
 	case copiedToClipboardMsg:
 		m.showCopied = false
 		return m, nil
 
+	// Handle command results
 	case containerStatusMsg:
 		currentItem := m.list.Items()[msg.index].(item)
 		switch msg.status {
@@ -173,7 +210,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(m.list.SetItem(msg.index, currentItem), checkImageCmd(msg.index, currentItem.config))
 		}
 		return m, m.list.SetItem(msg.index, currentItem)
-
 	case imageStatusMsg:
 		currentItem := m.list.Items()[msg.index].(item)
 		if msg.hasImage {
@@ -182,7 +218,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		currentItem.status = statusDownloading
 		return m, tea.Batch(m.list.SetItem(msg.index, currentItem), pullImageCmd(msg.index, currentItem.config))
-
 	case imagePulledMsg:
 		currentItem := m.list.Items()[msg.index].(item)
 		if msg.err != nil {
@@ -193,7 +228,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(m.list.SetItem(msg.index, currentItem), startContainerCmd(msg.index, currentItem.config, ""))
 		}
 		return m, m.list.SetItem(msg.index, currentItem)
-
 	case containerStartedMsg:
 		currentItem := m.list.Items()[msg.index].(item)
 		if msg.err != nil {
@@ -205,7 +239,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			currentItem.connectionString = msg.connectionString
 		}
 		return m, m.list.SetItem(msg.index, currentItem)
-
 	case containerStoppedMsg:
 		currentItem := m.list.Items()[msg.index].(item)
 		if msg.err != nil {
@@ -215,7 +248,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			currentItem.status = statusStopped
 		}
 		return m, m.list.SetItem(msg.index, currentItem)
-
 	case containerRemovedMsg:
 		currentItem := m.list.Items()[msg.index].(item)
 		if msg.err != nil {
@@ -233,58 +265,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.list.SetItem(msg.index, currentItem)
 	}
 
-	// Handle key presses and other messages
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
-
-	// Only handle these key presses if not in confirmation mode
-	if m.list.SelectedItem() != nil && m.list.SelectedItem().(item).confirming == actionNone {
-		switch keypress := msg.(type) {
-		case tea.KeyMsg:
-			switch keypress.String() {
-			case "ctrl+c", "q":
-				m.quitting = true
-				return m, stopAllContainersOnExit(m.list.Items())
-			case "s":
-				selectedItem, ok := m.list.SelectedItem().(item)
-				if ok && selectedItem.status == statusRunning {
-					selectedIndex := m.list.Index()
-					selectedItem.status = statusStopped
-					return m, tea.Batch(m.list.SetItem(selectedIndex, selectedItem), stopContainerCmd(selectedIndex, selectedItem.containerID))
-				}
-			case "b":
-				selectedItem, ok := m.list.SelectedItem().(item)
-				if ok && selectedItem.status == statusStopped {
-					selectedIndex := m.list.Index()
-					selectedItem.status = statusRestarting
-					return m, tea.Batch(m.list.SetItem(selectedIndex, selectedItem), restartContainerCmd(selectedIndex, selectedItem.config, selectedItem.containerID))
-				}
-			case "r":
-				selectedItem, ok := m.list.SelectedItem().(item)
-				if ok && selectedItem.containerID != "" {
-					selectedIndex := m.list.Index()
-					selectedItem.confirming = actionReset
-					return m, m.list.SetItem(selectedIndex, selectedItem)
-				}
-			case "d":
-				selectedItem, ok := m.list.SelectedItem().(item)
-				if ok && selectedItem.containerID != "" {
-					selectedIndex := m.list.Index()
-					selectedItem.confirming = actionDelete
-					return m, m.list.SetItem(selectedIndex, selectedItem)
-				}
-			case "c":
-				selectedItem, ok := m.list.SelectedItem().(item)
-				if ok && selectedItem.status == statusRunning && selectedItem.connectionString != "" {
-					m.showCopied = true
-					return m, tea.Batch(copyToClipboardCmd(selectedItem.connectionString), tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
-						return copiedToClipboardMsg{}
-					}))
-				}
-			}
-		}
-	}
-
 	m.spinner, cmd = m.spinner.Update(msg)
 	cmds = append(cmds, cmd)
 	m.list, cmd = m.list.Update(msg)
@@ -300,6 +282,9 @@ func (m model) View() string {
 	if m.quitting {
 		return docStyle.Render(fmt.Sprintf("\n%s Stopping containers... Please wait.\n", m.spinner.View()))
 	}
+	if m.showingHelp {
+		return m.renderFullHelpView()
+	}
 
 	detailView := m.renderDetailView()
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top, m.list.View(), detailPaneStyle.Render(detailView))
@@ -313,19 +298,16 @@ func (m model) renderDetailView() string {
 	if !ok {
 		return "Select a service to see details."
 	}
-
 	var b strings.Builder
 	b.WriteString(detailTitleStyle.Render(selectedItem.Title()))
 	b.WriteString("\n\n")
 	b.WriteString(fmt.Sprintf("%s: %s\n", detailAttrStyle.Render("Type"), detailValStyle.Render(selectedItem.config.Type)))
 	b.WriteString(fmt.Sprintf("%s: %s\n", detailAttrStyle.Render("Version"), detailValStyle.Render(selectedItem.config.Version)))
 	b.WriteString(fmt.Sprintf("%s: %s\n", detailAttrStyle.Render("Status"), selectedItem.Description()))
-
 	if selectedItem.status == statusRunning {
 		b.WriteString("\n")
 		b.WriteString(fmt.Sprintf("%s: %s\n", detailAttrStyle.Render("Host Port"), detailValStyle.Render(fmt.Sprintf("%d", selectedItem.config.Port))))
 		b.WriteString(fmt.Sprintf("%s: %s\n", detailAttrStyle.Render("Container ID"), detailValStyle.Render(selectedItem.containerID[:12])))
-
 		copyStatus := ""
 		if m.showCopied {
 			copyStatus = " " + copySuccessStyle.Render("Copied!")
@@ -338,11 +320,37 @@ func (m model) renderDetailView() string {
 	} else if selectedItem.confirming != actionNone {
 		b.WriteString(fmt.Sprintf("\n%s", confirmStyle.Render("Are you sure? This action cannot be undone.")))
 	}
-
 	return b.String()
 }
 
+func (m model) renderFullHelpView() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Plate Help"))
+	b.WriteString("\n\n")
+	b.WriteString(detailAttrStyle.Render("Plate is a simple TUI for managing development databases with Docker.\n"))
+	b.WriteString("It reads a `plate.config.json` file to provision the services you need.\n\n")
+
+	b.WriteString(detailTitleStyle.Render("In-App Commands") + "\n")
+	b.WriteString(fmt.Sprintf("%s: Navigate the list of services.\n", detailAttrStyle.Render("↑/↓")))
+	b.WriteString(fmt.Sprintf("%s: Show/hide this help screen.\n", detailAttrStyle.Render("h")))
+	b.WriteString(fmt.Sprintf("%s: Stop a running service.\n", detailAttrStyle.Render("s")))
+	b.WriteString(fmt.Sprintf("%s: Boot/start a stopped service.\n", detailAttrStyle.Render("b")))
+	b.WriteString(fmt.Sprintf("%s: Copy connection string for a running service.\n", detailAttrStyle.Render("c")))
+	b.WriteString(fmt.Sprintf("%s: Reset a service (stops, removes, and recreates it).\n", detailAttrStyle.Render("r")))
+	b.WriteString(fmt.Sprintf("%s: Delete a service (stops and removes its container).\n", detailAttrStyle.Render("d")))
+	b.WriteString(fmt.Sprintf("%s: Quit the application (stops running containers).\n\n", detailAttrStyle.Render("q/ctrl+c")))
+
+	b.WriteString(detailTitleStyle.Render("CLI Commands") + "\n")
+	b.WriteString(fmt.Sprintf("%s: Start the TUI.\n", detailAttrStyle.Render("plate")))
+	b.WriteString(fmt.Sprintf("%s: Create a default config file.\n", detailAttrStyle.Render("plate init")))
+	b.WriteString(fmt.Sprintf("%s: Show command-line help.\n\n", detailAttrStyle.Render("plate help")))
+
+	b.WriteString(helpStyle.Render("Press 'h', 'q', or 'esc' to return."))
+
+	return docStyle.Render(b.String())
+}
+
 func (m model) renderHelpView() string {
-	helpText := "↑/↓: navigate • q: quit • s: stop • b: boot • r: reset • d: delete • c: copy"
+	helpText := "↑/↓: navigate • h: help • q: quit • s: stop • b: boot • r: reset • d: delete • c: copy"
 	return helpStyle.Render("\n" + helpText)
 }
