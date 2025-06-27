@@ -1,0 +1,16 @@
+{
+  "services": [
+    {
+      "type": "postgres",
+      "name": "main-db",
+      "version": "14-alpine",
+      "port": 5433
+    },
+    {
+      "type": "redis",
+      "name": "cache",
+      "version": "7",
+      "port": 6380
+    }
+  ]
+}
