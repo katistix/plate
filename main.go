@@ -18,31 +18,27 @@ import (
 
 // --- STYLES ---
 var (
-	// Base document style
-	docStyle = lipgloss.NewStyle().Margin(1, 2)
-
-	// Title style for the main list
+	docStyle   = lipgloss.NewStyle().Margin(1, 2)
 	titleStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FFFDF5")).
 			Background(lipgloss.Color("#5A46E0")).
 			Padding(0, 1)
-
-	// Style for general help text
 	helpStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 
-	// Styles for different service statuses
+	// Status styles
 	errorStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	successStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("46"))
 	pendingStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
-	downloadingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("39")) // Blue for downloading
+	downloadingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	stoppedStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	confirmStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
 
-	// Style for the new detail view pane
+	// Detail view styles
 	detailTitleStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(lipgloss.Color("#FAFAFA")).
 				Background(lipgloss.Color("#7D56F4")).
 				Padding(0, 1)
-
 	detailAttrStyle = lipgloss.NewStyle().Bold(true)
 	detailValStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	detailPaneStyle = lipgloss.NewStyle().
@@ -72,15 +68,27 @@ const (
 	statusDownloading
 	statusStarting
 	statusRunning
-	statusAlreadyRunning
+	statusStopped
+	statusRestarting
+	statusResetting
+	statusDeleting
 	statusError
 )
 
 func (s status) String() string {
 	return [...]string{
-		"Pending...", "🔍 Checking...", "📥 Downloading...", "🚀 Starting...", "✅ Running", "✅ Already Running", "🔥 Error",
+		"Pending...", "🔍 Checking...", "📥 Downloading...", "🚀 Starting...", "✅ Running", "🛑 Stopped", "🔄 Restarting...", "💥 Resetting...", "🗑️ Deleting...", "🔥 Error",
 	}[s]
 }
+
+// Represents a pending destructive action that requires confirmation.
+type confirmationAction int
+
+const (
+	actionNone confirmationAction = iota
+	actionReset
+	actionDelete
+)
 
 // --- BUBBLE TEA MODEL & ITEMS ---
 type item struct {
@@ -89,6 +97,7 @@ type item struct {
 	statusText       string // Used for error messages
 	connectionString string
 	containerID      string
+	confirming       confirmationAction // Are we confirming a destructive action?
 }
 
 // Implement list.Item interface
@@ -104,28 +113,35 @@ func (i item) Title() string {
 }
 
 func (i item) Description() string {
+	if i.confirming == actionReset {
+		return confirmStyle.Render("Confirm Reset? (y/n)")
+	}
+	if i.confirming == actionDelete {
+		return confirmStyle.Render("Confirm Delete? (y/n)")
+	}
+
 	statusStr := i.status.String()
-	if i.status == statusError {
+	switch i.status {
+	case statusError:
 		return errorStyle.Render(fmt.Sprintf("%s: %s", statusStr, i.statusText))
-	}
-	if i.status == statusRunning || i.status == statusAlreadyRunning {
+	case statusRunning:
 		return successStyle.Render(statusStr)
-	}
-	if i.status == statusDownloading {
+	case statusDownloading:
 		return downloadingStyle.Render(statusStr)
+	case statusStopped:
+		return stoppedStyle.Render(statusStr)
+	default:
+		return pendingStyle.Render(statusStr)
 	}
-	return pendingStyle.Render(statusStr)
 }
 func (i item) FilterValue() string { return i.config.Name }
 
 // --- BUBBLE TEA MESSAGES ---
-// These messages drive the state machine for each service.
-
 // Reports the status after checking for an existing container.
 type containerStatusMsg struct {
 	index       int
 	containerID string
-	isRunning   bool
+	status      string // e.g., "running", "exited", ""
 }
 
 // Reports the status after checking for a local docker image.
@@ -140,7 +156,7 @@ type imagePulledMsg struct {
 	err   error
 }
 
-// Reports the final result of starting a container.
+// Reports the final result of starting/restarting a container.
 type containerStartedMsg struct {
 	index            int
 	containerID      string
@@ -148,7 +164,20 @@ type containerStartedMsg struct {
 	err              error
 }
 
-// A message to indicate cleanup is done.
+// Reports the result of stopping a container.
+type containerStoppedMsg struct {
+	index int
+	err   error
+}
+
+// Reports the result of deleting/resetting a container.
+type containerRemovedMsg struct {
+	index   int
+	err     error
+	isReset bool // To know if we should kick off a create process
+}
+
+// A message to indicate cleanup on exit is done.
 type cleanupCompleteMsg struct{}
 
 // --- MAIN MODEL ---
@@ -156,7 +185,7 @@ type model struct {
 	list     list.Model
 	spinner  spinner.Model
 	err      error
-	quitting bool // Flag to indicate we're in the process of shutting down
+	quitting bool
 }
 
 func initialModel(cfg PlateConfig) model {
@@ -169,14 +198,13 @@ func initialModel(cfg PlateConfig) model {
 	}
 
 	delegate := list.NewDefaultDelegate()
-	// Fine-tune styles for a cleaner look
 	delegate.Styles.SelectedTitle = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), false, false, false, true).BorderForeground(lipgloss.Color("170")).Foreground(lipgloss.Color("170")).Padding(0, 0, 0, 1)
 	delegate.Styles.SelectedDesc = delegate.Styles.SelectedTitle.Copy().Foreground(lipgloss.Color("250")).Faint(true)
 
 	l := list.New(items, delegate, 0, 0)
 	l.Title = "Plate Dev Environment"
 	l.Styles.Title = titleStyle
-	l.SetShowHelp(true) // We will manage our own help text.
+	l.SetShowHelp(false) // We render our own help.
 
 	s := spinner.New(spinner.WithSpinner(spinner.Dot), spinner.WithStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("205"))))
 
@@ -185,7 +213,7 @@ func initialModel(cfg PlateConfig) model {
 
 // --- BUBBLE TEA LOGIC ---
 func (m model) Init() tea.Cmd {
-	// Start the spinner and begin checking the status of all services concurrently
+	// Start checking the status of all services concurrently
 	cmds := make([]tea.Cmd, len(m.list.Items()))
 	for i, itm := range m.list.Items() {
 		currentItem := itm.(item)
@@ -196,13 +224,13 @@ func (m model) Init() tea.Cmd {
 	return tea.Batch(append(cmds, m.spinner.Tick)...)
 }
 
+//nolint:cyclop // This is the main update loop, it's complex by nature.
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// If we're quitting, we wait for the cleanup command to finish
+	// If quitting, wait for cleanup to finish
 	if m.quitting {
 		if _, ok := msg.(cleanupCompleteMsg); ok {
 			return m, tea.Quit
 		}
-		// While quitting, update the spinner
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
@@ -210,45 +238,107 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		// Adjust layout on window resize
 		h, v := docStyle.GetFrameSize()
-		// We'll give the list 40% of the width, and the detail view the rest.
-		listWidth := int(float32(msg.Width-h) * 0.4)
-		m.list.SetSize(listWidth, msg.Height-v)
+		listWidth := int(float32(msg.Width-h) * 0.45)
+		m.list.SetSize(listWidth, msg.Height-v-3) // Adjust for help text
 
 	case tea.KeyMsg:
+		selectedItem, ok := m.list.SelectedItem().(item)
+		if !ok {
+			return m, nil
+		}
+		selectedIndex := m.list.Index()
+
+		// Handle confirmation inputs
+		if selectedItem.confirming != actionNone {
+			switch msg.String() {
+			case "y", "Y":
+				switch selectedItem.confirming {
+				case actionReset:
+					selectedItem.status = statusResetting
+					selectedItem.confirming = actionNone
+					return m, tea.Batch(
+						m.list.SetItem(selectedIndex, selectedItem),
+						removeContainerCmd(selectedIndex, selectedItem.containerID, true),
+					)
+				case actionDelete:
+					selectedItem.status = statusDeleting
+					selectedItem.confirming = actionNone
+					return m, tea.Batch(
+						m.list.SetItem(selectedIndex, selectedItem),
+						removeContainerCmd(selectedIndex, selectedItem.containerID, false),
+					)
+				}
+			case "n", "N", "esc":
+				selectedItem.confirming = actionNone
+				return m, m.list.SetItem(selectedIndex, selectedItem)
+			}
+			return m, nil
+		}
+
+		// Handle normal key presses
 		switch msg.String() {
 		case "ctrl+c", "q":
 			m.quitting = true
-			return m, stopAllServices(m.list.Items())
+			return m, stopAllContainersOnExit(m.list.Items())
+
+		case "s": // Stop
+			if selectedItem.status == statusRunning {
+				selectedItem.status = statusStopped // Optimistic update
+				return m, tea.Batch(
+					m.list.SetItem(selectedIndex, selectedItem),
+					stopContainerCmd(selectedIndex, selectedItem.containerID),
+				)
+			}
+
+		case "b": // Boot / Start
+			if selectedItem.status == statusStopped {
+				selectedItem.status = statusRestarting
+				return m, tea.Batch(
+					m.list.SetItem(selectedIndex, selectedItem),
+					restartContainerCmd(selectedIndex, selectedItem.config, selectedItem.containerID),
+				)
+			}
+
+		case "r": // Reset
+			if selectedItem.containerID != "" {
+				selectedItem.confirming = actionReset
+				return m, m.list.SetItem(selectedIndex, selectedItem)
+			}
+
+		case "d": // Delete
+			if selectedItem.containerID != "" {
+				selectedItem.confirming = actionDelete
+				return m, m.list.SetItem(selectedIndex, selectedItem)
+			}
 		}
 
-	// A container's status has been checked
 	case containerStatusMsg:
 		currentItem := m.list.Items()[msg.index].(item)
-		if msg.isRunning {
-			currentItem.status = statusAlreadyRunning
+		switch msg.status {
+		case "running":
+			currentItem.status = statusRunning
 			currentItem.containerID = msg.containerID
 			currentItem.connectionString, _ = getConnectionString(currentItem.config)
 			return m, m.list.SetItem(msg.index, currentItem)
+		case "exited":
+			currentItem.status = statusStopped
+			currentItem.containerID = msg.containerID
+			return m, m.list.SetItem(msg.index, currentItem)
+		default: // Container doesn't exist
+			currentItem.status = statusChecking
+			return m, tea.Batch(m.list.SetItem(msg.index, currentItem), checkImageCmd(msg.index, currentItem.config))
 		}
-		// Not running, so now we check for the image
-		currentItem.status = statusChecking
-		return m, tea.Batch(m.list.SetItem(msg.index, currentItem), checkImageCmd(msg.index, currentItem.config))
 
-	// An image's status has been checked
 	case imageStatusMsg:
 		currentItem := m.list.Items()[msg.index].(item)
 		if msg.hasImage {
-			// Image exists, so we can start it
 			currentItem.status = statusStarting
-			return m, tea.Batch(m.list.SetItem(msg.index, currentItem), startContainerCmd(msg.index, currentItem.config))
+			return m, tea.Batch(m.list.SetItem(msg.index, currentItem), startContainerCmd(msg.index, currentItem.config, ""))
 		}
-		// Image doesn't exist, we need to pull it
 		currentItem.status = statusDownloading
 		return m, tea.Batch(m.list.SetItem(msg.index, currentItem), pullImageCmd(msg.index, currentItem.config))
 
-	// An image has finished pulling
 	case imagePulledMsg:
 		currentItem := m.list.Items()[msg.index].(item)
 		if msg.err != nil {
@@ -256,11 +346,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			currentItem.statusText = msg.err.Error()
 			return m, m.list.SetItem(msg.index, currentItem)
 		}
-		// Image pulled successfully, now we can start it
 		currentItem.status = statusStarting
-		return m, tea.Batch(m.list.SetItem(msg.index, currentItem), startContainerCmd(msg.index, currentItem.config))
+		return m, tea.Batch(m.list.SetItem(msg.index, currentItem), startContainerCmd(msg.index, currentItem.config, ""))
 
-	// A container has finished starting
 	case containerStartedMsg:
 		currentItem := m.list.Items()[msg.index].(item)
 		if msg.err != nil {
@@ -272,9 +360,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			currentItem.connectionString = msg.connectionString
 		}
 		return m, m.list.SetItem(msg.index, currentItem)
+
+	case containerStoppedMsg:
+		currentItem := m.list.Items()[msg.index].(item)
+		if msg.err != nil {
+			currentItem.status = statusError
+			currentItem.statusText = msg.err.Error()
+		} else {
+			currentItem.status = statusStopped
+		}
+		return m, m.list.SetItem(msg.index, currentItem)
+
+	case containerRemovedMsg:
+		currentItem := m.list.Items()[msg.index].(item)
+		if msg.err != nil {
+			currentItem.status = statusError
+			currentItem.statusText = msg.err.Error()
+			return m, m.list.SetItem(msg.index, currentItem)
+		}
+		currentItem.containerID = ""
+		currentItem.connectionString = ""
+		if msg.isReset {
+			// Kick off the creation process again after a reset
+			currentItem.status = statusChecking
+			return m, tea.Batch(m.list.SetItem(msg.index, currentItem), checkImageCmd(msg.index, currentItem.config))
+		}
+		currentItem.status = statusPending
+		return m, m.list.SetItem(msg.index, currentItem)
+
 	}
 
-	// Handle other messages (like spinner ticks and list navigation)
+	// Handle spinner and list updates
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
 	m.spinner, cmd = m.spinner.Update(msg)
@@ -290,20 +406,11 @@ func (m model) View() string {
 		return docStyle.Render(errorStyle.Render(fmt.Sprintf("Fatal error: %v", m.err)))
 	}
 	if m.quitting {
-		return docStyle.Render(fmt.Sprintf("\n%s Cleaning up containers... Please wait.\n", m.spinner.View()))
+		return docStyle.Render(fmt.Sprintf("\n%s Stopping containers... Please wait.\n", m.spinner.View()))
 	}
 
-	// Build the detail view pane
 	detailView := m.renderDetailView()
-
-	// Build the main layout
-	mainView := lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		m.list.View(),
-		detailPaneStyle.Render(detailView),
-	)
-
-	// Build the help text view
+	mainView := lipgloss.JoinHorizontal(lipgloss.Top, m.list.View(), detailPaneStyle.Render(detailView))
 	helpView := m.renderHelpView()
 
 	return docStyle.Render(lipgloss.JoinVertical(lipgloss.Left, mainView, helpView))
@@ -316,41 +423,31 @@ func (m model) renderDetailView() string {
 	}
 
 	var b strings.Builder
-
 	b.WriteString(detailTitleStyle.Render(selectedItem.Title()))
 	b.WriteString("\n\n")
 	b.WriteString(fmt.Sprintf("%s: %s\n", detailAttrStyle.Render("Type"), detailValStyle.Render(selectedItem.config.Type)))
 	b.WriteString(fmt.Sprintf("%s: %s\n", detailAttrStyle.Render("Version"), detailValStyle.Render(selectedItem.config.Version)))
 	b.WriteString(fmt.Sprintf("%s: %s\n", detailAttrStyle.Render("Status"), selectedItem.Description()))
 
-	if selectedItem.status == statusRunning || selectedItem.status == statusAlreadyRunning {
+	if selectedItem.status == statusRunning {
 		b.WriteString("\n")
 		b.WriteString(fmt.Sprintf("%s: %s\n", detailAttrStyle.Render("Host Port"), detailValStyle.Render(fmt.Sprintf("%d", selectedItem.config.Port))))
-		b.WriteString(fmt.Sprintf("%s: %s\n", detailAttrStyle.Render("Container ID"), detailValStyle.Render(selectedItem.containerID[:12]))) // Short ID
+		b.WriteString(fmt.Sprintf("%s: %s\n", detailAttrStyle.Render("Container ID"), detailValStyle.Render(selectedItem.containerID[:12])))
 		b.WriteString(fmt.Sprintf("%s:\n%s\n", detailAttrStyle.Render("Connection URL"), successStyle.Render(selectedItem.connectionString)))
+	} else if selectedItem.status == statusStopped {
+		b.WriteString(fmt.Sprintf("%s: %s\n", detailAttrStyle.Render("Container ID"), detailValStyle.Render(selectedItem.containerID[:12])))
 	} else if selectedItem.status == statusError {
 		b.WriteString(fmt.Sprintf("%s: %s\n", detailAttrStyle.Render("Details"), errorStyle.Render(selectedItem.statusText)))
+	} else if selectedItem.confirming != actionNone {
+		b.WriteString(fmt.Sprintf("\n%s", confirmStyle.Render("Are you sure? This action cannot be undone.")))
 	}
 
 	return b.String()
 }
 
 func (m model) renderHelpView() string {
-	allDone := true
-	for _, itm := range m.list.Items() {
-		if i := itm.(item); i.status < statusRunning { // Any state before Running/Error is not "done"
-			allDone = false
-			break
-		}
-	}
-
-	var builder strings.Builder
-	if allDone {
-		builder.WriteString(helpStyle.Render("↑/↓: navigate • q: quit & clean up"))
-	} else {
-		builder.WriteString(helpStyle.Render(fmt.Sprintf("%s Processing... • ↑/↓: navigate • q: quit & clean up", m.spinner.View())))
-	}
-	return builder.String()
+	helpText := "↑/↓: navigate • q: quit • s: stop • b: boot • r: reset • d: delete"
+	return helpStyle.Render("\n" + helpText)
 }
 
 // --- DOCKER COMMANDS ---
@@ -364,16 +461,10 @@ func checkContainerCmd(index int, config ServiceConfig) tea.Cmd {
 		if len(output) > 0 {
 			parts := strings.Split(strings.TrimSpace(string(output)), "\t")
 			if len(parts) == 2 {
-				// Container exists. Is it running?
-				if parts[1] == "running" {
-					return containerStatusMsg{index: index, containerID: parts[0], isRunning: true}
-				}
-				// It exists but is stopped, remove it before proceeding.
-				exec.Command("docker", "rm", "-f", containerName).Run()
+				return containerStatusMsg{index: index, containerID: parts[0], status: parts[1]}
 			}
 		}
-		// Container does not exist.
-		return containerStatusMsg{index: index, isRunning: false}
+		return containerStatusMsg{index: index, status: "not_found"}
 	}
 }
 
@@ -394,15 +485,14 @@ func pullImageCmd(index int, config ServiceConfig) tea.Cmd {
 	}
 }
 
-func startContainerCmd(index int, config ServiceConfig) tea.Cmd {
+// startContainerCmd is for creating and starting a NEW container.
+func startContainerCmd(index int, config ServiceConfig, containerID string) tea.Cmd {
 	return func() tea.Msg {
 		containerName := fmt.Sprintf("plate-%s-%s", config.Type, config.Name)
 		connStr, runArgs := getDockerRunArgs(config, containerName)
 
-		// We use CombinedOutput() here to capture both stdout and stderr for better error reporting.
 		runCmd := exec.Command("docker", runArgs...)
 		output, err := runCmd.CombinedOutput()
-
 		if err != nil {
 			return containerStartedMsg{index: index, err: fmt.Errorf(strings.TrimSpace(string(output)))}
 		}
@@ -414,19 +504,50 @@ func startContainerCmd(index int, config ServiceConfig) tea.Cmd {
 	}
 }
 
-func stopAllServices(items []list.Item) tea.Cmd {
+// restartContainerCmd is for starting an EXISTING, stopped container.
+func restartContainerCmd(index int, config ServiceConfig, containerID string) tea.Cmd {
+	return func() tea.Msg {
+		cmd := exec.Command("docker", "start", containerID)
+		if err := cmd.Run(); err != nil {
+			return containerStartedMsg{index: index, err: err}
+		}
+		// If successful, we can reconstruct the connection string.
+		connStr, _ := getConnectionString(config)
+		return containerStartedMsg{
+			index:            index,
+			containerID:      containerID,
+			connectionString: connStr,
+		}
+	}
+}
+
+func stopContainerCmd(index int, containerID string) tea.Cmd {
+	return func() tea.Msg {
+		err := exec.Command("docker", "stop", containerID).Run()
+		return containerStoppedMsg{index: index, err: err}
+	}
+}
+
+func removeContainerCmd(index int, containerID string, isReset bool) tea.Cmd {
+	return func() tea.Msg {
+		// Stop the container first to be safe.
+		_ = exec.Command("docker", "stop", containerID).Run()
+		err := exec.Command("docker", "rm", containerID).Run()
+		return containerRemovedMsg{index: index, err: err, isReset: isReset}
+	}
+}
+
+func stopAllContainersOnExit(items []list.Item) tea.Cmd {
 	return func() tea.Msg {
 		var wg sync.WaitGroup
 		for _, itm := range items {
 			item := itm.(item)
-			// We stop containers that have a container ID, regardless of their final state
-			// This is safer in case a container was started but an error occurred later.
-			if item.containerID != "" {
+			// Only stop containers that are actually running.
+			if item.containerID != "" && item.status == statusRunning {
 				wg.Add(1)
 				go func(cid string) {
 					defer wg.Done()
 					exec.Command("docker", "stop", cid).Run()
-					// The container will be removed automatically because we use the `--rm` flag in `startContainerCmd`
 				}(item.containerID)
 			}
 		}
@@ -449,8 +570,8 @@ func getConnectionString(config ServiceConfig) (string, error) {
 
 func getDockerRunArgs(config ServiceConfig, containerName string) (string, []string) {
 	connStr, _ := getConnectionString(config)
-	// Using --rm ensures containers are cleaned up when they are stopped.
-	baseArgs := []string{"run", "-d", "--rm", "--name", containerName}
+	// NOTE: We've removed the `--rm` flag to ensure persistence!
+	baseArgs := []string{"run", "-d", "--name", containerName}
 
 	switch config.Type {
 	case "postgres":
