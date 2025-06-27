@@ -2,7 +2,7 @@
   "services": [
     {
       "type": "postgres",
-      "name": "impactify",
+      "name": "main-database",
       "version": "14-alpine",
       "port": 5433
     },
