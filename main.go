@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -28,7 +27,7 @@ func main() {
 		configPath = os.Args[1]
 	}
 
-	configFile, err := ioutil.ReadFile(configPath)
+	configFile, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			fmt.Println("Error: Config file not found.")
@@ -55,20 +54,14 @@ func main() {
 // handleInitCmd creates a boilerplate plate.config.json.
 func handleInitCmd() {
 	const defaultConfig = `{
-  "services": [
-    {
-      "type": "postgres",
-      "name": "main-db",
-      "version": "14-alpine",
-      "port": 5433
-    },
-    {
-      "type": "redis",
-      "name": "cache",
-      "version": "7",
-      "port": 6380
-    }
-  ]
+		"services": [
+				{
+						"type": "postgres",
+						"name": "main-db",
+						"version": "14-alpine",
+						"port": 5433
+				},
+		]
 }`
 	configPath := "plate.config.json"
 	if _, err := os.Stat(configPath); err == nil {
@@ -76,7 +69,7 @@ func handleInitCmd() {
 		os.Exit(1)
 	}
 
-	err := ioutil.WriteFile(configPath, []byte(defaultConfig), 0644)
+	err := os.WriteFile(configPath, []byte(defaultConfig), 0644)
 	if err != nil {
 		fmt.Printf("Error writing config file: %v\n", err)
 		os.Exit(1)
@@ -90,11 +83,11 @@ func handleHelpCmd() {
 	fmt.Println(`Plate - A simple dev environment provisioner.
 
 Usage:
-  plate                  - Start the TUI with 'plate.config.json' in the current directory.
-  plate [path/to/config] - Start the TUI with a specific config file.
-  plate init             - Create a default 'plate.config.json' in the current directory.
-  plate help             - Show this help message.
+		plate                  - Start the TUI with 'plate.config.json' in the current directory.
+		plate [path/to/config] - Start the TUI with a specific config file.
+		plate init             - Create a default 'plate.config.json' in the current directory.
+		plate help             - Show this help message.
 
 In-App Commands:
-  Press 'h' inside the app to see a list of interactive commands.`)
+		Press 'h' inside the app to see a list of interactive commands.`)
 }

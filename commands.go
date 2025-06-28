@@ -96,11 +96,14 @@ func pullImageCmd(index int, config ServiceConfig) tea.Cmd {
 func startContainerCmd(index int, config ServiceConfig, containerID string) tea.Cmd {
 	return func() tea.Msg {
 		containerName := fmt.Sprintf("plate-%s-%s", config.Type, config.Name)
-		connStr, runArgs := getDockerRunArgs(config, containerName)
+		connStr, runArgs, err := getDockerRunArgs(config, containerName)
+		if err != nil {
+			return containerStartedMsg{index: index, err: err}
+		}
 		runCmd := exec.Command("docker", runArgs...)
 		output, err := runCmd.CombinedOutput()
 		if err != nil {
-			return containerStartedMsg{index: index, err: fmt.Errorf(strings.TrimSpace(string(output)))}
+			return containerStartedMsg{index: index, err: fmt.Errorf("%s", strings.TrimSpace(string(output)))}
 		}
 		return containerStartedMsg{index: index, containerID: strings.TrimSpace(string(output)), connectionString: connStr}
 	}

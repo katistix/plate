@@ -8,11 +8,21 @@ Stop messing with complex `docker-compose` files for simple projects. Plate read
 
 ## ✨ Features
 
-* **Declarative & Simple:** Define your services (Postgres, Redis, etc.) in a clean `json` file.
+* **Declarative & Simple:** Define your services (Postgres, Redis, MySQL, MongoDB) in a clean `json` file.
 * **Persistent Data:** Your data survives between sessions. Close the app and your database state is saved for the next run.
 * **Interactive TUI:** A beautiful and responsive terminal interface built with Bubble Tea.
 * **Full Lifecycle Management:** Boot, stop, reset, and delete services with single key presses.
 * **Clipboard Integration:** Copy a service's connection string directly to your clipboard.
+
+## Supported Services
+
+| Service  | Default Version | Default Port |
+| -------- | --------------- | ------------ |
+| Postgres | `14-alpine`     | `5433`       |
+| Redis    | `7`             | `6380`       |
+| MySQL    | `8`             | `3307`       |
+| MongoDB  | `latest`        | `27017`      |
+
 
 ## 🚀 Installation
 
@@ -48,14 +58,20 @@ export PATH=$PATH:$(go env GOPATH)/bin
         {
           "type": "postgres",
           "name": "main-db",
-          "version": "15-alpine",
-          "port": 5432
+          "version": "14-alpine",
+          "port": 5433
         },
         {
           "type": "redis",
           "name": "cache",
           "version": "7",
-          "port": 6379
+          "port": 6380
+        },
+        {
+          "type": "mysql",
+          "name": "main-db-2",
+          "version": "8",
+          "port": 3307
         }
       ]
     }

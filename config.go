@@ -26,22 +26,36 @@ func getConnectionString(config ServiceConfig) (string, error) {
 		return fmt.Sprintf("postgres://postgres:mysecretpassword@localhost:%d/postgres?sslmode=disable", config.Port), nil
 	case "redis":
 		return fmt.Sprintf("redis://localhost:%d", config.Port), nil
+	case "mysql":
+		return fmt.Sprintf("mysql://root:mysecretpassword@localhost:%d/mysql", config.Port), nil
+	case "mongodb":
+		return fmt.Sprintf("mongodb://localhost:%d", config.Port), nil
 	default:
 		return "", fmt.Errorf("unknown service type: %s", config.Type)
 	}
 }
 
 // getDockerRunArgs assembles the arguments for the `docker run` command.
-func getDockerRunArgs(config ServiceConfig, containerName string) (string, []string) {
-	connStr, _ := getConnectionString(config)
+func getDockerRunArgs(config ServiceConfig, containerName string) (string, []string, error) {
+	connStr, err := getConnectionString(config)
+	if err != nil {
+		return "", nil, err
+	}
+
 	baseArgs := []string{"run", "-d", "--name", containerName}
+	var args []string
+
 	switch config.Type {
 	case "postgres":
-		args := append(baseArgs, "-e", "POSTGRES_PASSWORD=mysecretpassword", "-p", fmt.Sprintf("%d:5432", config.Port), fmt.Sprintf("postgres:%s", config.Version))
-		return connStr, args
+		args = append(baseArgs, "-e", "POSTGRES_PASSWORD=mysecretpassword", "-p", fmt.Sprintf("%d:5432", config.Port), fmt.Sprintf("postgres:%s", config.Version))
 	case "redis":
-		args := append(baseArgs, "-p", fmt.Sprintf("%d:6379", config.Port), fmt.Sprintf("redis:%s", config.Version))
-		return connStr, args
+		args = append(baseArgs, "-p", fmt.Sprintf("%d:6379", config.Port), fmt.Sprintf("redis:%s", config.Version))
+	case "mysql":
+		args = append(baseArgs, "-e", "MYSQL_ROOT_PASSWORD=mysecretpassword", "-p", fmt.Sprintf("%d:3306", config.Port), fmt.Sprintf("mysql:%s", config.Version))
+	case "mongodb":
+		args = append(baseArgs, "-p", fmt.Sprintf("%d:27017", config.Port), fmt.Sprintf("mongo:%s", config.Version))
+	default:
+		return "", nil, fmt.Errorf("unknown service type: %s", config.Type)
 	}
-	return "", nil
+	return connStr, args, nil
 }
